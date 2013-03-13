@@ -1,0 +1,256 @@
+地址无关代码的研究
+作者:SAI
+
+
+先说下windows，考虑如下程序
+__declspec ( dllimport) int g_cat;//必须这么写，不能用extern int g_cat ;不然无法编译
+int main()
+{
+int * abc =&g_cat;
+printf("hehe\n");
+return 0;
+}
+这段代码中printf是外部模块中的函数，程序运行后，ntdll负责解析需要加载的dll，然后将dll的函数地址写入到IAT中，然后调用的汇编指令类似:
+0046C02A E8 B0 90 FF FF   call @ILT+8410(_printf) (4650DFh)
+0x4650DF是IAT中的一个地址，这里利用call指令相对寻址来引用函数地址，这个汇编指令没有地址硬编码，当主程序加载到不同的地址时，这片代码不需要重定位，所以可以做到内存中共享的，也就是只保存一份，就可以多个进程使用。
+
+但是如果是对外部变量的引用，如上面的g_cat，则产生的反汇编代码通常如下：
+0046BFED A1 30 27 55 00  mov eax,dword ptr [__imp_g_cat (552730h)] 
+这种反汇编指令后的30 27 55 00就是硬编码了(0x552730是主程序数据段的一个地址，在程序运行时，ntdll解析得到引用的外部变量g_cat地址写入到这里)，如果程序加载到不同地址，这几个字节就需要重定位，由于copy-write机制，在对代码段重定位后，就会创建这片代码的副本，所以每个进程都要保持一个副本，这个代码就不能做到内存共享。
+
+问题的本质原因还是mov指令，在32位上，mov指令无法像call指令一样使用相对寻址，不能使用类似下面这种来实现地址无关的反汇编指令：
+mov eax,[eip+0xABCD] //实际上32系统是无法这样直接操作eip的
+
+
+如果是64位程序的话，上面代码的反汇编指令可能是：
+0046BFED A1 30 27 55 00  mov rax , [rip+0xABCD] //主程序数据段的一个地址，保存g_cat地址
+这样就没有硬编码了，代码就可以内存共享了
+
+结论:windows上的32位程序，无法做到真正的代码段共享，从这点，也可以看出64位的优越性。
+
+=================================
+linux和macosx等unix衍生系统，为了解决这个问题，使用了一种称为“地址无关代码”的技术。
+gcc编译可执行文件时，加上-fPIE选项，编译共享模块时，加上-fPIC，就使用了“地址无关代码”技术。
+
+根据前面的论述，可以知道，如果能实现类似如下指令:
+mov ecx,eip //实际上32系统是无法这样直接操作eip的
+mov eax,[ecx+0xABCD]
+就可以实现没有硬编码，不需要重定位的代码，就可以实现内存共享。
+
+当开启“地址无关代码”选项后，linux上为了得到eip，使用类似如下方式获取eip：
+call next:
+mov eax,[ecx+0xABCD] //主程序数据段的一个地址，保持g_cat地址，在linux上是.got节
+......
+next:
+mov ecx,[esp]
+ret
+
+macosx更简单，使用类似如下方式获取eip：
+call next:
+next:
+pop eax
+mov eax,[ecx+0xABCD] //主程序数据段的一个地址，保持g_cat地址，macosx上可能是__la_symbol_ptr和__nl_symbol_ptr节？不确定~
+......
+
+这样，无论g_cat变量是在当前编译的文件中，还是在其他目标文件中，还是在一个共享模块中，都可以产生地址无关代码解决代码段共享问题。
+
+=================================
+下面开始测试，测试环境：
+archlinux 64位 gcc版本4.7.2
+macosx 10.8.2 64位 gcc版本4.2.1
+
+测试动态库的代码share.cpp如下：
+#include <stdio.h>
+int g_cat=1234;
+int hello_cat()
+{
+    g_cat=0x233;
+    return 0;
+} 
+
+测试主程序的代码main.cpp如下：
+#include <stdio.h>
+extern int g_cat;
+int main(int argc,char *argv[])
+{
+    int * abc=&g_cat;
+    printf("%d\n",*abc);
+    return 0;
+}
+
+Makefile如下：
+all: nopic64 nopic32 pic64 pic32
+
+nopic64:
+     g++ -g -shared share.cpp -o nopic64.so
+     g++ -g main.cpp -o nopic64.exe ./nopic64.so
+pic64:
+     g++ -g -shared share.cpp -o pic64.so -fPIC
+     g++ -g main.cpp -o pic64.exe ./pic64.so
+
+nopic32:
+     g++ -g -shared share.cpp -o nopic32.so -m32
+     g++ -g main.cpp -o nopic32.exe ./nopic32.so -m32
+
+
+pic32:
+     g++ -g -shared share.cpp -o pic32.so -m32 -fPIC
+     g++ -g main.cpp -o pic32.exe ./pic32.so -m32
+
+
+clean:
+     rm -rf *.so *.o *.exe *.dSYM
+
+======================================
+先在macosx上测试，会发现pic64.exe和nopic64.exe完全一样，反汇编代码类似如下：
+main:
+......
+0x0000000100000ef4 <main+20>:     mov    0x13d(%rip),%rax        # 0x100001038---这里从exe数据段中取得动态库中g_cat的地址
+......
+0x0000000100000f06 <main+38>:     mov    (%rax),%eax #得到g_cat的值
+......
+
+hello_cat:
+......
+0x0000000100003f54 <_Z9hello_catv+4>:     movl   $0x233,0xa2(%rip)        # 0x100004000 <g_cat> 为g_cat赋值
+......
+可以看到g_cat是保存在动态库中的，64位mov指令可以直接使用rip做相对寻址，这片代码能共享，开不开pic选项都无所谓
+
+======================================
+在macosx上测试pic32.exe：
+main:
+......
+0x00001ef6 <main+6>:     call   0x1efb <main+11>
+0x00001efb <main+11>:     pop    %eax
+......
+0x00001f08 <main+24>:     mov    0x121(%eax),%ecx //这里从exe数据段中取得动态库中g_cat的地址
+......
+0x00001f16 <main+38>:     mov    (%ecx),%ecx //得到g_cat的值
+......
+
+hello_cat:
+......
+0x00a3cf86 <_Z9hello_catv+6>:     call   0xa3cf8b <_Z9hello_catv+11>
+0x00a3cf8b <_Z9hello_catv+11>:     pop    %eax
+0x00a3cf8c <_Z9hello_catv+12>:     movl   $0x233,0x75(%eax) //为g_cat赋值
+......
+
+这里可以看到果然是用call/pop的方式得到eip，然后产生地址无关代码的，所以这片代码仍然能共享
+======================================
+然后在macosx上测试nopic32.exe，这里要注意macosx下动态库.so是无论如何都会开启pic的，无法关掉，exe则默认是开启fpic的，如果要强制关掉需要使用-mdynamic-no-pic，此时编译出来的exe默认加载地址在0x0上
+g++ -g main.cpp -o nopic32.exe ./nopic32.so -m32 -mdynamic-no-pic
+编译会产生一个警告
+ld: warning: PIE disabled. Absolute addressing (perhaps -mdynamic-no-pic) not allowed in code signed PIE, but used in _main from /var/folders/x8/2pwbyp611yz2bpt8mpympt5r0000gn/T//ccPDPOHq.o. To fix this warning, don't compile with -mdynamic-no-pic or link with -Wl,-no_pie
+
+看下反汇编代码：
+main:
+......
+0x00001f02 <main+18>:     mov    0x201c,%eax //这里从exe数据段中取得动态库中g_cat的地址，这里有硬编码！
+......
+0x00001f0f <main+31>:     mov    (%eax),%eax //得到g_cat的值
+......
+
+hello_cat:
+......
+0x00a3cf86 <_Z9hello_catv+6>:     call   0xa3cf8b <_Z9hello_catv+11>
+0x00a3cf8b <_Z9hello_catv+11>:     pop    %eax
+0x00a3cf8c <_Z9hello_catv+12>:     movl   $0x233,0x75(%eax) //为g_cat赋值
+......
+
+可以看到动态库始终是开启pic的，而主程序由于禁用了pic，则存在地址相关代码，其中0x201c这个地址被硬编码了，程序只有加载在0地址时，这个地址才能访问正确，所以这个代码需要重定位来fix，无法内存共享。
+=================================
+再来看看linux下的测试结果
+
+我在linux上测试发现64位动态库没法不开启pic，编译会报错
+[sai@arch test]$ g++ -g -shared share.cpp -o nopic64.so 
+/usr/bin/ld: /tmp/ccdfykqh.o: relocation R_X86_64_PC32 against symbol `g_cat' can not be used when making a shared object; recompile with -fPIC /usr/bin/ld: final link failed: 错误的值
+collect2: 错误：ld 返回 1
+
+所以编译64位的动态库都需要加上-fPIC编译成功后，还是先看下nopic64.exe
+main:
+......
+0x00000000004006db <+15>:     movq   $0x600b38,-0x8(%rbp) //这里从exe数据段中取得动态库中g_cat的地址，这里有硬编码！
+0x00000000004006e3 <+23>:     mov    -0x8(%rbp),%rax
+0x00000000004006e7 <+27>:     mov    (%rax),%eax //得到g_cat的值
+......
+
+hello_cat:
+......
+0x00007ffff7bda6a4 <+4>:     mov    0x2002cd(%rip),%rax        # 0x7ffff7dda978 这里从exe数据段中取得动态库中g_cat的地址
+0x00007ffff7bda6ab <+11>:     movl   $0x233,(%rax) //为g_cat赋值
+......
+
+这里和macosx不同，macosx上是只有64位都利用了rip的间接寻址，而这里可以看到愚蠢的使用硬编码0x600b38，所以linux上即便64位程序，要想使得代码共享，也需要显示的开启pic选项
+
+======================================
+修改Makefile
+g++ -g main.cpp -o pic64.exe ./pic64.so -fPIE
+来看看linux上显示开启pic选项后的pic64.exe
+
+main:
+......
+0x00000000004006cb <+15>:     mov    0x200416(%rip),%rax        # 0x600ae8 这里从exe数据段中取得动态库中g_cat的地址
+0x00000000004006d2 <+22>:     mov    %rax,-0x8(%rbp)
+0x00000000004006d6 <+26>:     mov    -0x8(%rbp),%rax
+0x00000000004006da <+30>:     mov    (%rax),%eax //得到g_cat的值
+......
+
+hello_cat:
+......
+0x00007ffff7bda6a4 <+4>:     mov    0x2002cd(%rip),%rax        # 0x7ffff7dda978 这里从exe数据段中取得动态库中g_cat的地址
+0x00007ffff7bda6ab <+11>:     movl   $0x233,(%rax) //为g_cat赋值
+......
+
+果然开启pic选项后，利用了rip的间接寻址，实现了地址无关代码
+======================================
+再来看linux上nopic32.exe：
+main:
+......
+0x08048575 <+9>:     movl   $0x8049848,0x1c(%esp)//这里直接取得动态库中g_cat的地址，硬编码0x8049848地址是主程序的！所以这里肯定是要重定位的
+0x0804857d <+17>:     mov    0x1c(%esp),%eax
+0x08048581 <+21>:     mov    (%eax),%eax //得到g_cat的值
+......
+
+hello_cat:
+......
+0xf7fd851f <+3>:     movl   $0x233,0x8049848 //为g_cat赋值，0x8049848地址是主程序的！所以这里肯定是要重定位的
+......
+
+上面最值得注意的就是，此时g_cat变量已经不在.so中了，而是在主程序exe中！所以这种编译方式，动态库编译时会将本地的全局变量也认为是外部的，即便g_cat是在动态库中初始化的，在初始化后值也会被拷贝到主程序的exe中（传说中的“共享模块的全局变量问题”）
+======================================
+最后来看下pic32.exe：
+main:
+......
+0x08048576 <+10>:     call   0x80484a0 <__x86.get_pc_thunk.bx>//这里call下方，再返回回来得到eip
+0x0804857b <+15>:     add    $0x12c5,%ebx
+0x08048581 <+21>:     mov    -0x4(%ebx),%eax //eax得到g_cat的地址
+0x08048587 <+27>:     mov    %eax,0x1c(%esp)
+0x0804858b <+31>:     mov    0x1c(%esp),%eax
+0x0804858f <+35>:     mov    (%eax),%eax //为g_cat赋值
+......
+
+hello_cat:
+......
+0xf7fd851f <+3>:     call   0xf7fd853d <__x86.get_pc_thunk.cx>//这里call下方，再返回回来得到eip
+0xf7fd8524 <+8>:     add    $0x11e8,%ecx
+0xf7fd852a <+14>:     mov    -0x8(%ecx),%eax //eax得到g_cat的地址
+0xf7fd8530 <+20>:     movl   $0x233,(%eax) //为g_cat赋值
+......
+0xf7fd853d <+0>:     mov    (%esp),%ecx
+0xf7fd8540 <+3>:     ret   
+
+======================================
+最后，对于“地址无关代码”的生成，总结如下
+1.
+macosx上动态库始终采用“地址无关代码”，64位是利用rip间接寻址，32位是利用call/pop得到eip，没有选项能禁用。
+
+2.
+macosx上可执行程序exe，默认是开启的，64位是利用rip间接寻址，32位是利用call/pop得到eip，用-mdynamic-no-pic选项可以禁用，此时加载地址为0。
+
+3.
+linux上动态库，64位是利用rip间接寻址，32位是利用call/pop得到eip，64位必须加-fPIC不然编译不通过，换句话说64位一定是开启的，32位默认没有开启，要想开启必须显示-fPIC
+
+4.
+linux上可执行程序exe，64位是利用rip间接寻址，32位是利用call/pop得到eip，64位和32位默认都没有开启，要想开启必须显示用-fPIE
+
+
